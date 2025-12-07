@@ -39,7 +39,7 @@ echo "This may take 30-60 seconds..."
 TRACK_RESPONSE=$(curl -s -X POST $BASE_URL/api/track-prices \
   -H "Content-Type: application/json" \
   -d '{
-    "my_listing_id": "858697692672545141",
+    "my_listing_id": "1388743231740997415",
     "num_days": 5,
     "currency": "USD"
   }')

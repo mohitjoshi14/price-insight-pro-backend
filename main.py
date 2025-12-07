@@ -35,7 +35,7 @@ PLAYWRIGHT_TIMEOUT = 60000  # 60 seconds (increased for API interception)
 SUPPORTED_CURRENCIES = ["INR", "USD", "EUR", "GBP", "AUD", "CAD", "SGD", "AED"]
 MAX_COMPETITORS = 3
 MAX_DAYS = 7
-STAY_LENGTH_NIGHTS = 2  # Number of nights per stay
+STAY_LENGTH_NIGHTS = 1  # Number of nights per stay
 REQUEST_DELAY = (1, 2)
 AIRBNB_BASE_URL = "https://www.airbnb.com"
 
@@ -206,12 +206,12 @@ async def fetch_price_via_api(listing_id: str, check_in: str, check_out: str, cu
         page = await context.new_page()
 
         # Define response handler to intercept API calls
-        def handle_response(response):
+        async def handle_response(response):
             nonlocal price
             # Look for StaysPdpSections GraphQL response
             if 'StaysPdpSections' in response.url and price is None:
                 try:
-                    data = response.json()
+                    data = await response.json()
                     data_str = json.dumps(data)
 
                     # Find priceString in response using regex
