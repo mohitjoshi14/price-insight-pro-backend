@@ -24,29 +24,29 @@ curl -s $BASE_URL/health | jq . 2>/dev/null || echo "Error: Invalid JSON respons
 
 echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
 
-echo -e "\n=== 3. Submit Email ==="
-curl -s -X POST $BASE_URL/api/submit-email \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "test@example.com",
-    "name": "Test User",
-    "listing_id": "51969750",
-    "subscribe_updates": false
-  }' | jq . 2>/dev/null || echo "Error: Invalid JSON response"
-
-# echo -e "\n=== 4. Track Prices (Small Test) ==="
-# echo "This may take 30-60 seconds..."
-# TRACK_RESPONSE=$(curl -s -X POST $BASE_URL/api/track-prices \
+# echo -e "\n=== 3. Submit Email ==="
+# curl -s -X POST $BASE_URL/api/submit-email \
 #   -H "Content-Type: application/json" \
 #   -d '{
-#     "my_listing_id": "1563238432740070089",
-#     "num_days": 2,
-#     "currency": "USD"
-#   }')
+#     "email": "test@example.com",
+#     "name": "Test User",
+#     "listing_id": "51969750",
+#     "subscribe_updates": false
+#   }' | jq . 2>/dev/null || echo "Error: Invalid JSON response"
 
-# echo "$TRACK_RESPONSE" | jq . 2>/dev/null || {
-#   echo "Error parsing response. Raw output:"
-#   echo "$TRACK_RESPONSE"
-# }
+echo -e "\n=== 4. Track Prices (Small Test) ==="
+echo "This may take 30-60 seconds..."
+TRACK_RESPONSE=$(curl -s -X POST $BASE_URL/api/track-prices \
+  -H "Content-Type: application/json" \
+  -d '{
+    "my_listing_id": "858697692672545141",
+    "num_days": 5,
+    "currency": "USD"
+  }')
+
+echo "$TRACK_RESPONSE" | jq . 2>/dev/null || {
+  echo "Error parsing response. Raw output:"
+  echo "$TRACK_RESPONSE"
+}
 
 echo -e "\n=== Done ==="

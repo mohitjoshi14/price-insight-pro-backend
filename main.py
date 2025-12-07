@@ -1,7 +1,11 @@
 """
+
 Airbnb Price Tracking API
+
 Stack: FastAPI, Playwright async_api, Pydantic, Redis cache, PostgreSQL
+
 Run: uvicorn main:app --host 0.0.0.0 --port 8000
+
 """
 
 import json
@@ -14,7 +18,6 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, unquote
-
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -27,9 +30,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ==================== CONFIGURATION ====================
-
 CACHE_EXPIRY_HOURS = 12
-PLAYWRIGHT_TIMEOUT = 45000  # 45 seconds
+PLAYWRIGHT_TIMEOUT = 60000  # 60 seconds (increased for API interception)
 SUPPORTED_CURRENCIES = ["INR", "USD", "EUR", "GBP", "AUD", "CAD", "SGD", "AED"]
 MAX_COMPETITORS = 3
 MAX_DAYS = 7
@@ -47,7 +49,6 @@ redis_client = None
 db_conn = None
 
 # ==================== PYDANTIC MODELS ====================
-
 class SuggestCompetitorsRequest(BaseModel):
     listing_url: str
 
@@ -95,7 +96,6 @@ class SubmitEmailRequest(BaseModel):
     subscribe_updates: bool = False
 
 # ==================== DATABASE SETUP ====================
-
 def init_postgres():
     """Initialize PostgreSQL connection and create leads table."""
     global db_conn
@@ -131,7 +131,6 @@ def init_redis():
         redis_client = None
 
 # ==================== HELPER FUNCTIONS ====================
-
 def extract_listing_id(url: str) -> str:
     """Extract listing ID from Airbnb URL."""
     match = re.search(r'/rooms/(\d+)', url)
@@ -148,7 +147,6 @@ def normalize_airbnb_url(url: str) -> str:
     return url.replace("airbnb.co.in", "airbnb.com").replace("airbnb.co.uk", "airbnb.com")
 
 # ==================== CACHE UTILITIES (REDIS) ====================
-
 def get_cache_key(listing_id: str, check_in: str, currency: str) -> str:
     return f"price:{listing_id}:{check_in}:{currency}"
 
@@ -156,7 +154,6 @@ def get_cached_price(listing_id: str, check_in: str, currency: str) -> Optional[
     """Get price from Redis cache."""
     if not redis_client:
         return None
-    
     try:
         cache_key = get_cache_key(listing_id, check_in, currency)
         cached_data = redis_client.get(cache_key)
@@ -164,14 +161,12 @@ def get_cached_price(listing_id: str, check_in: str, currency: str) -> Optional[
             return int(cached_data)
     except Exception as e:
         print(f"Redis get error: {e}")
-    
     return None
 
 def set_cached_price(listing_id: str, check_in: str, currency: str, price: int) -> None:
     """Set price in Redis cache with expiry."""
     if not redis_client:
         return
-    
     try:
         cache_key = get_cache_key(listing_id, check_in, currency)
         expiry_seconds = CACHE_EXPIRY_HOURS * 3600
@@ -179,11 +174,11 @@ def set_cached_price(listing_id: str, check_in: str, currency: str, price: int) 
     except Exception as e:
         print(f"Redis set error: {e}")
 
-# ==================== ASYNC SCRAPING FUNCTIONS ====================
-
-async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: str) -> tuple[Optional[int], bool]:
+# ==================== ASYNC SCRAPING FUNCTIONS (API INTERCEPTION) ====================
+async def fetch_price_via_api(listing_id: str, check_in: str, check_out: str, currency: str) -> tuple[Optional[int], bool]:
     """
-    Fetch price from Airbnb listing. Returns (price, cached) or (None, False) on failure.
+    Fetch price by intercepting Airbnb's GraphQL API response.
+    Returns (price, cached) or (None, False) on failure.
     """
     # Check cache first
     cached_price = get_cached_price(listing_id, check_in, currency)
@@ -191,10 +186,10 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
         return cached_price, True
 
     url = f"{AIRBNB_BASE_URL}/rooms/{listing_id}?adults=2&check_in={check_in}&check_out={check_out}&currency={currency}"
-
     price = None
+
     async with async_playwright() as p:
-        # Connect to Railway Browserless instead of launching locally
+        # Connect to Railway Browserless or local browser
         if BROWSERLESS_ENDPOINT:
             browser = await p.chromium.connect(BROWSERLESS_ENDPOINT)
             context = await browser.new_context(
@@ -202,50 +197,62 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
         else:
-            # Fallback for local development
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-        
+
         page = await context.new_page()
 
-        try:
-            await page.goto(url, timeout=PLAYWRIGHT_TIMEOUT, wait_until="load")
-            await asyncio.sleep(random.uniform(*REQUEST_DELAY))
-
-            price_selectors = [
-                "._1k1ce2w",
-                "[data-testid='price-item-total']",
-                "span._tyxjp1",
-                "._1qs94rc span",
-                "span._1y74zjx",
-            ]
-
-            for selector in price_selectors:
+        # Define response handler to intercept API calls
+        def handle_response(response):
+            nonlocal price
+            # Look for StaysPdpSections GraphQL response
+            if 'StaysPdpSections' in response.url and price is None:
                 try:
-                    price_element = await page.query_selector(selector)
-                    if price_element:
-                        price_text = await price_element.inner_text()
-                        numbers = re.findall(r'[\d,]+', price_text)
-                        if numbers:
-                            price = int(numbers[0].replace(",", ""))
-                            break
-                except Exception:
-                    continue
+                    data = response.json()
+                    data_str = json.dumps(data)
+
+                    # Find priceString in response using regex
+                    matches = re.findall(r'"PriceString":\s*"[^\d]*([\d|\,]+)"', data_str)
+                    if matches:
+                        price_str = matches[0].replace(',', '')
+                        price = int(price_str)
+                        print(f"✓ Found price via API: {currency} {price}")
+                except Exception as e:
+                    pass
+
+        try:
+            # Set up response listener
+            page.on('response', handle_response)
+
+            # Navigate to the page and wait for API response
+            await page.goto(url, wait_until='domcontentloaded', timeout=PLAYWRIGHT_TIMEOUT)
+
+            # Wait up to 30 attempts (500ms each = 15 seconds max)
+            for _ in range(30):
+                if price is not None:
+                    break
+                await page.wait_for_timeout(500)
 
         except Exception as e:
-            print(f"Error scraping price for {listing_id} on {check_in}: {e}")
+            print(f"Error fetching price for {listing_id} on {check_in}: {e}")
         finally:
             await page.close()
             await context.close()
             await browser.close()
 
+    # Cache the price if found
     if price is not None:
         set_cached_price(listing_id, check_in, currency, price)
 
     return price, False
+
+# Alias for backward compatibility
+async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: str) -> tuple[Optional[int], bool]:
+    """Wrapper function - uses API interception method."""
+    return await fetch_price_via_api(listing_id, check_in, check_out, currency)
 
 async def fetch_listing_name(listing_id: str) -> str:
     """Scrape h1 tag from listing page."""
@@ -266,7 +273,7 @@ async def fetch_listing_name(listing_id: str) -> str:
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-        
+
         page = await context.new_page()
 
         try:
@@ -278,7 +285,6 @@ async def fetch_listing_name(listing_id: str) -> str:
                 text = await h1_element.inner_text()
                 if text.strip():
                     name = text.strip()
-
         except Exception as e:
             print(f"Error fetching name for {listing_id}: {e}")
         finally:
@@ -290,53 +296,46 @@ async def fetch_listing_name(listing_id: str) -> str:
 
 async def extract_listing_name_from_card(card_element, listing_id: str) -> str:
     """Extract listing name from a search result card element."""
-    
-    # Try multiple strategies to get the listing name
     title_selectors = [
         "[data-testid='listing-card-title']",
         "[data-testid='listing-card-name']",
         "div[id*='title']",
-        ".t1jojoys",  # Common Airbnb title class
-        "div[role='img'] + div",  # Title often follows the image
+        ".t1jojoys",
+        "div[role='img'] + div",
     ]
 
-    # Strategy 1: Look for title in specific data attributes
     for selector in title_selectors:
         try:
             title_element = await card_element.query_selector(selector)
             if title_element:
                 title_text = await title_element.inner_text()
                 if title_text and len(title_text.strip()) > 0:
-                    # Clean up the title
                     title = title_text.strip()
-                    # Remove common prefixes that aren't part of the actual title
                     if not title.startswith("Property"):
                         return title[:100]
         except Exception:
             continue
 
-    # Strategy 2: Look for any div with specific text patterns (property descriptions)
+    # Strategy 2: Look for text patterns
     try:
-        # Find all text content in the card
         all_divs = await card_element.query_selector_all("div")
-        for div in all_divs[:10]:  # Check first 10 divs only for performance
+        for div in all_divs[:10]:
             try:
                 text = await div.inner_text()
                 text = text.strip()
-                # Look for text that looks like a title (not too short, not a price, not a location)
-                if (text and 
-                    len(text) > 10 and 
+                if (text and
+                    len(text) > 10 and
                     len(text) < 100 and
-                    not re.match(r'^[₹$€£¥]', text) and  # Not a price
-                    not re.match(r'^\d+\s*(guest|bed|bath)', text, re.IGNORECASE) and  # Not capacity info
-                    not re.match(r'^\d+\.\d+\s*★', text)):  # Not a rating
+                    not re.match(r'^[₹$€£¥]', text) and
+                    not re.match(r'^\d+\s*(guest|bed|bath)', text, re.IGNORECASE) and
+                    not re.match(r'^\d+\.\d+\s*★', text)):
                     return text
             except Exception:
                 continue
     except Exception:
         pass
 
-    # Strategy 3: Get aria-label from the link itself
+    # Strategy 3: aria-label
     try:
         link = await card_element.query_selector("a[href*='/rooms/']")
         if link:
@@ -346,7 +345,6 @@ async def extract_listing_name_from_card(card_element, listing_id: str) -> str:
     except Exception:
         pass
 
-    # Fallback
     return f"Nearby Property {listing_id}"
 
 async def auto_find_competitors_async(listing_url: str, max_results: int = 5) -> List[DetectedCompetitor]:
@@ -366,7 +364,6 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
     print(f"Target Listing: {listing_id}")
 
     async with async_playwright() as p:
-        # Connect to Railway Browserless
         if BROWSERLESS_ENDPOINT:
             browser = await p.chromium.connect(BROWSERLESS_ENDPOINT)
             context = await browser.new_context(
@@ -379,11 +376,10 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-        
+
         page = await context.new_page()
 
         try:
-            # Load listing page to get location
             await page.goto(listing_url, timeout=PLAYWRIGHT_TIMEOUT, wait_until="load")
             await asyncio.sleep(5)
 
@@ -423,7 +419,7 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
             await page.goto(search_url, timeout=PLAYWRIGHT_TIMEOUT, wait_until="load")
             await asyncio.sleep(4)
 
-            # Find all listing cards
+            # Find listing cards
             card_containers = await page.query_selector_all(
                 "[itemprop='itemListElement'], [data-testid='card-container'], div[data-testid='listing-card']"
             )
@@ -460,7 +456,6 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
                             continue
 
                         seen_ids.add(comp_id)
-
                         name = await extract_listing_name_from_card(card, comp_id)
 
                         thumbnail = None
@@ -477,7 +472,6 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
                             listing_name=name,
                             thumbnail=thumbnail
                         ))
-
                         print(f"✓ {comp_id}: {name[:60]}")
 
                     except Exception as e:
@@ -496,7 +490,6 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
     return competitors
 
 # ==================== FASTAPI APP ====================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Airbnb Price Tracking API starting...")
@@ -504,13 +497,13 @@ async def lifespan(app: FastAPI):
         print(f"✅ Connected to Browserless: {BROWSERLESS_ENDPOINT[:50]}...")
     else:
         print("⚠️  Running in local mode (no Browserless)")
-    
+
     # Initialize databases
     init_redis()
     init_postgres()
-    
+
     yield
-    
+
     # Cleanup
     if redis_client:
         redis_client.close()
@@ -520,8 +513,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Airbnb Price Tracking API",
-    description="Track and compare Airbnb listing prices",
-    version="1.0.0",
+    description="Track and compare Airbnb listing prices via API interception",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -534,11 +527,11 @@ app.add_middleware(
 )
 
 # ==================== ENDPOINTS ====================
-
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
+        "method": "API Interception",
         "browserless_connected": bool(BROWSERLESS_ENDPOINT),
         "redis_connected": redis_client is not None,
         "postgres_connected": db_conn is not None,
@@ -550,12 +543,13 @@ async def clear_cache():
     """Clear all cached prices from Redis."""
     if not redis_client:
         raise HTTPException(status_code=503, detail="Redis not available")
-    
+
     try:
-        # Delete all keys matching price:*
+        count = 0
         for key in redis_client.scan_iter("price:*"):
             redis_client.delete(key)
-        return {"status": "success", "message": "Cache cleared"}
+            count += 1
+        return {"status": "success", "message": f"Cleared {count} cached prices"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -583,7 +577,6 @@ async def track_prices(request: TrackPricesRequest):
         for i, check_in in enumerate(dates):
             check_out = (today + timedelta(days=i+STAY_LENGTH_NIGHTS)).isoformat()
             price, cached = await fetch_price(lid, check_in, check_out, request.currency)
-
             prices.append({
                 "date": check_in,
                 "price": price,
@@ -607,6 +600,7 @@ async def track_prices(request: TrackPricesRequest):
     competitor_tasks = [get_listing_prices(cid) for cid in request.competitor_listing_ids]
 
     results = await asyncio.gather(my_property_task, *competitor_tasks)
+
     my_property = results[0]
     competitors_data = results[1:]
 
@@ -638,7 +632,6 @@ async def track_prices_stream_endpoint(
     body_request: Optional[TrackPricesRequest] = None
 ):
     """Unified SSE endpoint supporting GET and POST."""
-
     my_listing_id = ""
     competitor_ids = []
     curr = "USD"
@@ -680,7 +673,6 @@ async def track_prices_stream_endpoint(
 
             curr = currency or "USD"
             days = tracking_days or 7
-
         except Exception as e:
             return StreamingResponse(
                 iter([f"data: {json.dumps({'type': 'error', 'message': f'Invalid input: {str(e)}'})}\n\n"]),
@@ -692,7 +684,7 @@ async def track_prices_stream_endpoint(
             today = datetime.now().date()
             date_range = [(today + timedelta(days=i)).isoformat() for i in range(days)]
 
-            yield f"data: {json.dumps({'type': 'started', 'message': 'Price tracking initiated.'})}\n\n"
+            yield f"data: {json.dumps({'type': 'started', 'message': 'Price tracking initiated via API interception.'})}\n\n"
 
             my_name = await fetch_listing_name(my_listing_id)
             my_prices = []
@@ -735,8 +727,8 @@ async def track_prices_stream_endpoint(
                     "min_price": min(valid_prices) if valid_prices else 0,
                     "max_price": max(valid_prices) if valid_prices else 0
                 }
-                competitors_data.append(comp_data)
 
+                competitors_data.append(comp_data)
                 yield f"data: {json.dumps({'type': 'competitor_complete', 'data': comp_data})}\n\n"
 
             all_avgs = [c["average_price"] for c in competitors_data if c["average_price"] > 0]
@@ -755,6 +747,7 @@ async def track_prices_stream_endpoint(
                     "generated_at": datetime.now().isoformat() + "Z"
                 }
             }
+
             yield f"data: {json.dumps(final_report)}\n\n"
 
         except Exception as e:
@@ -775,7 +768,7 @@ async def submit_email(request: SubmitEmailRequest):
     """Store email lead in PostgreSQL database."""
     if not db_conn:
         raise HTTPException(status_code=503, detail="Database not available")
-    
+
     try:
         cursor = db_conn.cursor()
         cursor.execute("""
@@ -794,7 +787,7 @@ async def get_leads():
     """Get all leads from database (admin endpoint)."""
     if not db_conn:
         raise HTTPException(status_code=503, detail="Database not available")
-    
+
     try:
         cursor = db_conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("SELECT * FROM leads ORDER BY created_at DESC")
