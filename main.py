@@ -146,8 +146,11 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
     async with async_playwright() as p:
         # Connect to Railway Browserless instead of launching locally
         if BROWSERLESS_ENDPOINT:
-            browser = await p.chromium.connect_over_cdp(BROWSERLESS_ENDPOINT)
-            context = browser.contexts[0]  # Use existing context
+            browser = await p.chromium.connect(BROWSERLESS_ENDPOINT)
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         else:
             # Fallback for local development
             browser = await p.chromium.launch(headless=True)
@@ -186,8 +189,7 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
             print(f"Error scraping price for {listing_id} on {check_in}: {e}")
         finally:
             await page.close()
-            if not BROWSERLESS_ENDPOINT:
-                await context.close()
+            await context.close()
             await browser.close()
 
     if price is not None:
@@ -207,8 +209,11 @@ async def fetch_listing_name(listing_id: str) -> str:
     async with async_playwright() as p:
         # Connect to Railway Browserless
         if BROWSERLESS_ENDPOINT:
-            browser = await p.chromium.connect_over_cdp(BROWSERLESS_ENDPOINT)
-            context = browser.contexts[0]
+            browser = await p.chromium.connect(BROWSERLESS_ENDPOINT)
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         else:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
@@ -232,8 +237,7 @@ async def fetch_listing_name(listing_id: str) -> str:
             print(f"Error fetching name for {listing_id}: {e}")
         finally:
             await page.close()
-            if not BROWSERLESS_ENDPOINT:
-                await context.close()
+            await context.close()
             await browser.close()
 
     return name
@@ -318,8 +322,11 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
     async with async_playwright() as p:
         # Connect to Railway Browserless
         if BROWSERLESS_ENDPOINT:
-            browser = await p.chromium.connect_over_cdp(BROWSERLESS_ENDPOINT)
-            context = browser.contexts[0]
+            browser = await p.chromium.connect(BROWSERLESS_ENDPOINT)
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         else:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
@@ -437,8 +444,7 @@ async def auto_find_competitors_async(listing_url: str, max_results: int = 5) ->
             print(f"\nERROR: {e}")
         finally:
             await page.close()
-            if not BROWSERLESS_ENDPOINT:
-                await context.close()
+            await context.close()
             await browser.close()
 
     return competitors
