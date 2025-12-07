@@ -20,7 +20,7 @@ curl -s $BASE_URL/health | jq . 2>/dev/null || echo "Error: Invalid JSON respons
 echo -e "\n=== 2. Suggest Competitors ==="
 RESPONSE=$(curl -s -X POST $BASE_URL/api/suggest-competitors \
   -H "Content-Type: application/json" \
-  -d '{"listing_url": "https://www.airbnb.com/rooms/51969750"}')
+  -d '{"listing_url": "https://www.airbnb.com/rooms/1563238432740070089"}')
 
 echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
 
@@ -39,7 +39,7 @@ echo "This may take 30-60 seconds..."
 TRACK_RESPONSE=$(curl -s -X POST $BASE_URL/api/track-prices \
   -H "Content-Type: application/json" \
   -d '{
-    "my_listing_id": "51969750",
+    "my_listing_id": "1563238432740070089",
     "num_days": 2,
     "currency": "USD"
   }')

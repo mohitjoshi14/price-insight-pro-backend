@@ -1,18 +1,16 @@
 """
 Airbnb Price Tracking API
-Stack: FastAPI, Playwright async_api, Pydantic, file-based caching
+Stack: FastAPI, Playwright async_api, Pydantic, Redis cache, PostgreSQL
 Run: uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import json
 import re
-import csv
 import time
 import random
 import asyncio
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, unquote
@@ -23,10 +21,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
+# Database imports
+import redis
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 # ==================== CONFIGURATION ====================
 
-CACHE_FILE = Path("price_cache.json")
-LEADS_FILE = Path("leads.csv")
 CACHE_EXPIRY_HOURS = 12
 PLAYWRIGHT_TIMEOUT = 45000  # 45 seconds
 SUPPORTED_CURRENCIES = ["INR", "USD", "EUR", "GBP", "AUD", "CAD", "SGD", "AED"]
@@ -36,8 +37,14 @@ STAY_LENGTH_NIGHTS = 2  # Number of nights per stay
 REQUEST_DELAY = (1, 2)
 AIRBNB_BASE_URL = "https://www.airbnb.com"
 
-# Railway Browserless configuration
+# Railway Configuration
 BROWSERLESS_ENDPOINT = os.environ.get('BROWSER_PLAYWRIGHT_ENDPOINT_PRIVATE', '')
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+# Global connections
+redis_client = None
+db_conn = None
 
 # ==================== PYDANTIC MODELS ====================
 
@@ -87,6 +94,42 @@ class SubmitEmailRequest(BaseModel):
     listing_id: str
     subscribe_updates: bool = False
 
+# ==================== DATABASE SETUP ====================
+
+def init_postgres():
+    """Initialize PostgreSQL connection and create leads table."""
+    global db_conn
+    try:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                listing_id VARCHAR(50) NOT NULL,
+                subscribe_updates BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db_conn.commit()
+        cursor.close()
+        print("✅ PostgreSQL connected and table initialized")
+    except Exception as e:
+        print(f"⚠️  PostgreSQL connection failed: {e}")
+        db_conn = None
+
+def init_redis():
+    """Initialize Redis connection."""
+    global redis_client
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        print("✅ Redis connected")
+    except Exception as e:
+        print(f"⚠️  Redis connection failed: {e}")
+        redis_client = None
+
 # ==================== HELPER FUNCTIONS ====================
 
 def extract_listing_id(url: str) -> str:
@@ -104,27 +147,37 @@ def normalize_airbnb_url(url: str) -> str:
     """Normalize Airbnb URL to use .com domain."""
     return url.replace("airbnb.co.in", "airbnb.com").replace("airbnb.co.uk", "airbnb.com")
 
-# ==================== CACHE UTILITIES ====================
-
-def load_cache() -> dict:
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-def save_cache(cache: dict) -> None:
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=2)
+# ==================== CACHE UTILITIES (REDIS) ====================
 
 def get_cache_key(listing_id: str, check_in: str, currency: str) -> str:
-    return f"{listing_id}_{check_in}_{currency}"
+    return f"price:{listing_id}:{check_in}:{currency}"
 
-def is_cache_valid(timestamp: str) -> bool:
-    cached_time = datetime.fromisoformat(timestamp)
-    return datetime.now() - cached_time < timedelta(hours=CACHE_EXPIRY_HOURS)
+def get_cached_price(listing_id: str, check_in: str, currency: str) -> Optional[int]:
+    """Get price from Redis cache."""
+    if not redis_client:
+        return None
+    
+    try:
+        cache_key = get_cache_key(listing_id, check_in, currency)
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return int(cached_data)
+    except Exception as e:
+        print(f"Redis get error: {e}")
+    
+    return None
+
+def set_cached_price(listing_id: str, check_in: str, currency: str, price: int) -> None:
+    """Set price in Redis cache with expiry."""
+    if not redis_client:
+        return
+    
+    try:
+        cache_key = get_cache_key(listing_id, check_in, currency)
+        expiry_seconds = CACHE_EXPIRY_HOURS * 3600
+        redis_client.setex(cache_key, expiry_seconds, price)
+    except Exception as e:
+        print(f"Redis set error: {e}")
 
 # ==================== ASYNC SCRAPING FUNCTIONS ====================
 
@@ -132,13 +185,10 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
     """
     Fetch price from Airbnb listing. Returns (price, cached) or (None, False) on failure.
     """
-    cache = load_cache()
-    cache_key = get_cache_key(listing_id, check_in, currency)
-
-    if cache_key in cache:
-        entry = cache[cache_key]
-        if is_cache_valid(entry["timestamp"]):
-            return entry["price"], True
+    # Check cache first
+    cached_price = get_cached_price(listing_id, check_in, currency)
+    if cached_price is not None:
+        return cached_price, True
 
     url = f"{AIRBNB_BASE_URL}/rooms/{listing_id}?adults=2&check_in={check_in}&check_out={check_out}&currency={currency}"
 
@@ -193,11 +243,7 @@ async def fetch_price(listing_id: str, check_in: str, check_out: str, currency: 
             await browser.close()
 
     if price is not None:
-        cache[cache_key] = {
-            "price": price,
-            "timestamp": datetime.now().isoformat()
-        }
-        save_cache(cache)
+        set_cached_price(listing_id, check_in, currency, price)
 
     return price, False
 
@@ -458,7 +504,18 @@ async def lifespan(app: FastAPI):
         print(f"✅ Connected to Browserless: {BROWSERLESS_ENDPOINT[:50]}...")
     else:
         print("⚠️  Running in local mode (no Browserless)")
+    
+    # Initialize databases
+    init_redis()
+    init_postgres()
+    
     yield
+    
+    # Cleanup
+    if redis_client:
+        redis_client.close()
+    if db_conn:
+        db_conn.close()
     print("👋 Shutting down...")
 
 app = FastAPI(
@@ -483,14 +540,24 @@ async def health_check():
     return {
         "status": "healthy",
         "browserless_connected": bool(BROWSERLESS_ENDPOINT),
+        "redis_connected": redis_client is not None,
+        "postgres_connected": db_conn is not None,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.delete("/api/clear-cache")
 async def clear_cache():
-    if CACHE_FILE.exists():
-        CACHE_FILE.unlink()
-    return {"status": "success", "message": "Cache cleared"}
+    """Clear all cached prices from Redis."""
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+    
+    try:
+        # Delete all keys matching price:*
+        for key in redis_client.scan_iter("price:*"):
+            redis_client.delete(key)
+        return {"status": "success", "message": "Cache cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/suggest-competitors", response_model=SuggestCompetitorsResponse)
 async def suggest_competitors(request: SuggestCompetitorsRequest):
@@ -705,13 +772,37 @@ async def track_prices_stream_endpoint(
 
 @app.post("/api/submit-email")
 async def submit_email(request: SubmitEmailRequest):
-    file_exists = LEADS_FILE.exists()
-    with open(LEADS_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["email", "name", "listing_id", "subscribe_updates", "timestamp"])
-        writer.writerow([request.email, request.name, request.listing_id, request.subscribe_updates, datetime.now().isoformat()])
-    return {"status": "success", "message": "Email submitted successfully"}
+    """Store email lead in PostgreSQL database."""
+    if not db_conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            INSERT INTO leads (email, name, listing_id, subscribe_updates)
+            VALUES (%s, %s, %s, %s)
+        """, (request.email, request.name, request.listing_id, request.subscribe_updates))
+        db_conn.commit()
+        cursor.close()
+        return {"status": "success", "message": "Email submitted successfully"}
+    except Exception as e:
+        db_conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/leads")
+async def get_leads():
+    """Get all leads from database (admin endpoint)."""
+    if not db_conn:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM leads ORDER BY created_at DESC")
+        leads = cursor.fetchall()
+        cursor.close()
+        return {"leads": leads, "count": len(leads)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
