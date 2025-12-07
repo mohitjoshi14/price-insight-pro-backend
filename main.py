@@ -185,7 +185,7 @@ async def fetch_price_via_api(listing_id: str, check_in: str, check_out: str, cu
     if cached_price is not None:
         return cached_price, True
 
-    url = f"{AIRBNB_BASE_URL}/rooms/{listing_id}?adults=2&check_in={check_in}&check_out={check_out}&currency={currency}"
+    url = f"{AIRBNB_BASE_URL}/rooms/{listing_id}?adults=1&check_in={check_in}&check_out={check_out}&currency={currency}"
     price = None
 
     async with async_playwright() as p:
